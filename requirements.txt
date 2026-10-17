@@ -1,0 +1,14 @@
+SpeechRecognition
+pyaudio
+pyttsx3
+vosk
+apscheduler
+plyer
+dateparser
+customtkinter
+pygame
+psutil
+pyautogui
+wikipedia
+pyjokes
+pywhatkit
