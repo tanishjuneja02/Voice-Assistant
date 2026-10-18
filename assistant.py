@@ -1,3 +1,5 @@
+import os
+import random
 import re
 import time
 import threading
@@ -5,11 +7,16 @@ import sqlite3
 import subprocess
 import webbrowser
 from datetime import datetime, timedelta
+from urllib.parse import quote_plus
 
 import speech_recognition as sr
 import pyttsx3
 
 LANGUAGE = "en-IN"   # Indian English. If recognition gets worse, try "en-US"
+
+DICTATION_DIR = "dictations"      # dictation text files are saved here
+AUTO_OPEN_DICTATION = True        # open the saved file in Notepad automatically
+SCREENSHOT_DIR = "screenshots"    # screenshots are saved here
 
 recognizer = sr.Recognizer()
 recognizer.dynamic_energy_threshold = True
@@ -37,29 +44,62 @@ MIC_INDEX = find_mic()
 
 # ---------------- SPEAK / LISTEN ----------------
 _speak_lock = threading.Lock()   # stops two voices talking at once
+_com = threading.local()
+
+EVENT_HOOK = None                # the window (gui.py) sets this to get updates
+
+
+def emit(kind, text=""):
+    """Tell the window (if there is one) what is happening."""
+    if EVENT_HOOK:
+        try:
+            EVENT_HOOK(kind, text)
+        except Exception:
+            pass
+
+
+def ensure_com():
+    """The Windows voice needs COM started once in every thread."""
+    if getattr(_com, "ready", False):
+        return
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+    except Exception:
+        pass
+    _com.ready = True
 
 
 def speak(text):
     print("Assistant:", text)
+    emit("assistant", text)
+    emit("status", "speaking")
+    ensure_com()
     with _speak_lock:
         engine = pyttsx3.init()
         engine.say(text)
         engine.runAndWait()
+    emit("status", "idle")
 
 
 def listen():
     with sr.Microphone(device_index=MIC_INDEX) as source:
         recognizer.adjust_for_ambient_noise(source, duration=0.5)
         print("Listening...")
+        emit("status", "listening")
         try:
             audio = recognizer.listen(source, timeout=6, phrase_time_limit=12)
         except sr.WaitTimeoutError:
+            emit("status", "idle")
             return ""
+    emit("status", "thinking")
     try:
         text = recognizer.recognize_google(audio, language=LANGUAGE)
         print("You said:", text)
+        emit("user", text)
         return text.lower()
     except sr.UnknownValueError:
+        emit("status", "idle")
         return ""
     except sr.RequestError:
         speak("I cannot reach the internet")
@@ -81,6 +121,11 @@ def init_db():
         text TEXT,
         due TEXT,
         done INTEGER DEFAULT 0)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS dictations(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        file TEXT,
+        text TEXT,
+        created TEXT)""")
     db.commit()
     db.close()
 
@@ -607,6 +652,7 @@ def show_popup(text):
 def alert(text):
     """What happens when a reminder is due: popup + alarm sound + voice."""
     print(f"\n*** REMINDER: {text} ***")
+    emit("reminder", text)
     threading.Thread(target=show_popup, args=(text,), daemon=True).start()
     play_alert_sound()
     speak(f"Reminder: {text}")
@@ -634,6 +680,163 @@ def reminder_checker():
         except Exception as e:
             print("Reminder checker error:", e)
         time.sleep(3)
+
+
+# ---------------- DICTATION (speech-to-text) ----------------
+SPOKEN_PUNCTUATION = [
+    (r"\bnew paragraph\b", "\n\n"),
+    (r"\b(?:new line|next line)\b", "\n"),
+    (r"\bfull stop\b", "."),
+    (r"\bcomma\b", ","),
+    (r"\bquestion mark\b", "?"),
+    (r"\b(?:exclamation mark|exclamation point)\b", "!"),
+    (r"\bcolon\b", ":"),
+]
+STOP_DICT = re.compile(
+    r"\b(?:stop|end|finish|complete)\s+(?:the\s+|my\s+)?dictat\w*"
+    r"|\bend of dictation\b", re.I)
+CANCEL_DICT = re.compile(
+    r"\b(?:cancel|discard|abort)\s+(?:the\s+|my\s+)?dictat\w*", re.I)
+UNDO_DICT = re.compile(
+    r"(?:delete|remove|undo|scratch)(?: that| the last \w+| last \w+)?", re.I)
+DICTATION_RE = re.compile(r"dictat|voice typing|speech.to.text")
+
+
+def apply_spoken_punctuation(text):
+    """'hello comma how are you question mark' -> 'hello , how are you ?'"""
+    for pattern, symbol in SPOKEN_PUNCTUATION:
+        text = re.sub(pattern, symbol, text, flags=re.I)
+    return text
+
+
+def tidy_dictation(text):
+    """Clean spacing and capital letters in the finished text."""
+    text = re.sub(r"[ \t]+([.,?!:;])", r"\1", text)      # no space before . , ?
+    text = re.sub(r"[ \t]*\n[ \t]*", "\n", text)
+    text = re.sub(r"\bi\b", "I", text)                   # i -> I, i'm -> I'm
+    text = re.sub(r"(^|[.?!]\s+|\n)([a-z])",
+                  lambda m: m.group(1) + m.group(2).upper(), text)
+    return text.strip()
+
+
+def process_dictation_phrase(phrase, parts):
+    """Handle one spoken phrase. Returns 'continue', 'stop' or 'cancel'."""
+    phrase = phrase.strip()
+    if CANCEL_DICT.search(phrase):
+        return "cancel"
+    if UNDO_DICT.fullmatch(phrase.lower()):
+        if parts:
+            print("   (removed:", parts.pop().strip(), ")")
+        return "continue"
+    m = STOP_DICT.search(phrase)
+    content = phrase[:m.start()] if m else phrase
+    content = apply_spoken_punctuation(content).strip(" \t")
+    if content:                               # keeps new lines / paragraphs
+        parts.append(content)
+    return "stop" if m else "continue"
+
+
+def save_dictation(text):
+    os.makedirs(DICTATION_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    path = os.path.join(DICTATION_DIR, f"dictation_{stamp}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text + "\n")
+    db = sqlite3.connect(DB)
+    db.execute("INSERT INTO dictations(file, text, created) VALUES(?, ?, ?)",
+               (path, text, datetime.now().strftime("%Y-%m-%d %H:%M")))
+    db.commit()
+    db.close()
+    return path
+
+
+def open_file(path):
+    try:
+        os.startfile(os.path.abspath(path))      # opens in Notepad on Windows
+    except Exception as e:
+        print("Could not open the file:", e)
+
+
+def dictate():
+    """Listen continuously, turn speech into text, save it to a .txt file."""
+    speak("Dictation started. Speak now. Say stop dictation when you are "
+          "finished.")
+    parts = []
+    outcome = "stop"
+    quiet_rounds = 0
+    old_pause = recognizer.pause_threshold
+    recognizer.pause_threshold = 1.5             # allow longer pauses
+    try:
+        with sr.Microphone(device_index=MIC_INDEX) as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.7)
+            print("\n--- DICTATING --- (say 'stop dictation' to finish)")
+            emit("status", "listening")
+            while True:
+                try:
+                    audio = recognizer.listen(source, timeout=10,
+                                              phrase_time_limit=30)
+                    phrase = recognizer.recognize_google(audio,
+                                                         language=LANGUAGE)
+                except (sr.WaitTimeoutError, sr.UnknownValueError):
+                    quiet_rounds += 1
+                    if quiet_rounds >= 3:        # about 30 seconds of nothing
+                        outcome = "silence"
+                        break
+                    continue
+                except sr.RequestError:
+                    outcome = "offline"
+                    break
+                quiet_rounds = 0
+                print("  >", phrase)
+                emit("dictation", phrase)
+                action = process_dictation_phrase(phrase, parts)
+                if action != "continue":
+                    outcome = action
+                    break
+    finally:
+        recognizer.pause_threshold = old_pause
+
+    if outcome == "cancel":
+        speak("Dictation cancelled. Nothing was saved")
+        return
+    text = tidy_dictation(" ".join(parts))
+    if not text:
+        speak("I did not hear anything to save")
+        return
+    if outcome == "silence":
+        speak("I did not hear you for a while, so I stopped")
+    elif outcome == "offline":
+        speak("I lost the internet connection. Saving what I have")
+    path = save_dictation(text)
+    print("\n----- YOUR TEXT -----\n" + text + "\n---------------------")
+    speak(f"Dictation saved. {len(text.split())} words")
+    print("Saved to:", path)
+    if AUTO_OPEN_DICTATION:
+        open_file(path)
+
+
+def read_last_dictation():
+    db = sqlite3.connect(DB)
+    row = db.execute(
+        "SELECT text FROM dictations ORDER BY id DESC LIMIT 1").fetchone()
+    db.close()
+    if not row:
+        speak("You have no dictations yet")
+        return
+    speak("Your last dictation says")
+    speak(row[0][:600])
+
+
+def open_last_dictation():
+    db = sqlite3.connect(DB)
+    row = db.execute(
+        "SELECT file FROM dictations ORDER BY id DESC LIMIT 1").fetchone()
+    db.close()
+    if not row or not os.path.exists(row[0]):
+        speak("I could not find a saved dictation")
+        return
+    speak("Opening your last dictation")
+    open_file(row[0])
 
 
 # ---------------- APPROVED APPLICATIONS ----------------
@@ -710,6 +913,294 @@ def is_list_request(command):
     return asking and about_apps
 
 
+# ---------------- EXTRA COMMANDS ----------------
+CHEAT_SHEET = """
+===================== VOICE COMMANDS =====================
+ Notes      take a note ...  |  read my notes  |  delete all notes
+ Reminders  remind me in 5 minutes to ...  |  what are my reminders
+            change reminder number 1 to 6 pm  |  delete reminder number 1
+ Apps       open notepad / calculator / chrome ...  |  what can you open
+ Dictation  start dictation ... stop dictation  |  read my last dictation
+ Info       what time is it  |  today's date  |  battery status  |  cpu usage
+ Web        search google for ...  |  play ... on youtube  |  tell me about ...
+ System     take a screenshot  |  volume up / down  |  mute  |  show desktop
+ Fun        tell me a joke  |  test the alarm
+ Stop       stop
+==========================================================
+"""
+
+
+def classify_extra(command):
+    """Decide which extra command this is. Returns (name, argument)."""
+    c = command.strip()
+
+    if (re.fullmatch(r"help|help me", c)
+            or re.search(r"\b(?:what can you do|your features|show commands|"
+                         r"list commands|list of commands)\b", c)):
+        return "help", None
+    if re.search(r"\b(?:who are you|your name|introduce yourself)\b", c):
+        return "intro", None
+    if re.search(r"\bhow are you\b", c):
+        return "how_are_you", None
+    if re.search(r"\bthank(?:s| you)\b", c):
+        return "thanks", None
+    if len(c.split()) <= 4 and re.search(
+            r"\b(?:hello|hi|hey|namaste|good (?:morning|afternoon|evening))\b", c):
+        return "greet", None
+
+    m = re.match(r"(?:search(?: on)? (?:google|the web|web)(?: for)?|"
+                 r"google search(?: for)?|search for|search|google) (.+)$", c)
+    if m:
+        return "google", m.group(1).strip()
+    m = re.match(r"play (.+?)(?: on youtube| in youtube| youtube)?$", c)
+    if m:
+        return "youtube", m.group(1).strip()
+    m = re.match(r"(?:tell me about|who is|who was|who are|wikipedia|"
+                 r"search wikipedia for|what is the meaning of) (.+)$", c)
+    if m:
+        return "wiki", m.group(1).strip()
+
+    if re.search(r"\bwhat(?:'s| is)? the time\b|\btime is it\b|"
+                 r"\bcurrent time\b|\btell me the time\b|^time$", c):
+        return "time", None
+    if re.search(r"today'?s date|\bthe date\b|\bwhat day\b|\bcurrent date\b|"
+                 r"\bdate today\b|^date$", c):
+        return "date", None
+    if re.search(r"\bbattery\b", c):
+        return "battery", None
+    if re.search(r"\b(?:cpu|ram|processor|system status|memory usage|"
+                 r"performance)\b", c):
+        return "system", None
+    if re.search(r"\bscreen ?shot\b|\bscreen capture\b|"
+                 r"\bcapture (?:the |my )?screen\b", c):
+        return "screenshot", None
+    if re.search(r"\b(?:volume|mute|unmute|louder|quieter)\b", c):
+        return "volume", c
+    if re.search(r"\bjokes?\b", c):
+        return "joke", None
+    if re.search(r"\bshow (?:the )?desktop\b|"
+                 r"\bminimi[sz]e (?:all )?(?:the )?windows\b", c):
+        return "desktop", None
+    return None, None
+
+
+def time_message(now):
+    return f"It is {fmt_time(now)}"
+
+
+def date_message(now):
+    return f"Today is {now.strftime('%A')}, {now.day} {now.strftime('%B %Y')}"
+
+
+def battery_message(percent, plugged, secs_left=None):
+    percent = round(percent)
+    if plugged:
+        msg = f"Battery is at {percent} percent and charging"
+    else:
+        msg = f"Battery is at {percent} percent and not charging"
+        if secs_left and secs_left > 0:
+            h, m = divmod(secs_left // 60, 60)
+            msg += f", about {h} hours {m} minutes left"
+        if percent < 20:
+            msg += ". Battery is low, please plug in the charger"
+    return msg
+
+
+def system_message(cpu, ram):
+    return (f"CPU usage is {round(cpu)} percent "
+            f"and memory usage is {round(ram)} percent")
+
+
+def clean_summary(text):
+    """Remove (brackets) so the voice reads smoothly."""
+    return re.sub(r"\s*\([^)]*\)", "", text).strip()
+
+
+# ---- actions ----
+def say_time():
+    speak(time_message(datetime.now()))
+
+
+def say_date():
+    speak(date_message(datetime.now()))
+
+
+def say_battery():
+    try:
+        import psutil
+        b = psutil.sensors_battery()
+    except Exception:
+        b = None
+    if b is None:
+        speak("I could not find a battery on this computer")
+        return
+    speak(battery_message(b.percent, b.power_plugged, b.secsleft))
+
+
+def say_system():
+    try:
+        import psutil
+        speak(system_message(psutil.cpu_percent(interval=1),
+                             psutil.virtual_memory().percent))
+    except Exception:
+        speak("Sorry, I could not read the system status")
+
+
+def take_screenshot():
+    try:
+        import pyautogui
+        os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        path = os.path.join(SCREENSHOT_DIR, f"screenshot_{stamp}.png")
+        pyautogui.screenshot().save(path)
+        print("Saved to:", path)
+        speak("Screenshot saved")
+    except Exception as e:
+        print("Screenshot error:", e)
+        speak("Sorry, I could not take the screenshot")
+
+
+LEVEL_WORDS = {
+    "zero": 0, "five": 5, "ten": 10, "fifteen": 15, "twenty": 20,
+    "twenty five": 25, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+    "seventy": 70, "eighty": 80, "ninety": 90, "hundred": 100,
+    "half": 50, "full": 100, "max": 100, "maximum": 100,
+}
+
+
+def parse_volume_level(command):
+    """'set volume to 50' / 'volume to fifty percent' -> 50, else None."""
+    m = re.search(r"\b(\d{1,3})\b", command)
+    if m:
+        return min(100, int(m.group(1)))
+    for word in sorted(LEVEL_WORDS, key=len, reverse=True):
+        if re.search(r"\b" + word + r"\b", command):
+            return LEVEL_WORDS[word]
+    return None
+
+
+def change_volume(command):
+    try:
+        import pyautogui
+    except Exception:
+        speak("Sorry, volume control is not available")
+        return
+    if re.search(r"\b(?:mute|unmute)\b", command):
+        pyautogui.press("volumemute")
+        speak("Done")
+        return
+
+    relative = re.search(r"\b(?:up|down|increase|decrease|raise|lower|reduce|"
+                         r"louder|quieter|more|less|higher)\b", command)
+    level = parse_volume_level(command)
+    if level is not None and (not relative or re.search(r"\bto\b", command)):
+        pyautogui.press("volumedown", presses=50, interval=0.01)   # to zero
+        pyautogui.press("volumeup", presses=round(level / 2), interval=0.01)
+        speak(f"Volume set to about {level} percent")
+    elif re.search(r"\b(?:up|increase|raise|louder|higher|more)\b", command):
+        pyautogui.press("volumeup", presses=5, interval=0.02)
+        speak("Volume increased")
+    elif re.search(r"\b(?:down|decrease|lower|reduce|quieter|less)\b", command):
+        pyautogui.press("volumedown", presses=5, interval=0.02)
+        speak("Volume decreased")
+    else:
+        speak("Say volume up, volume down, mute, or set volume to 50 percent")
+
+
+def tell_joke():
+    try:
+        import pyjokes
+        speak(pyjokes.get_joke())
+    except Exception:
+        speak("Why do programmers prefer dark mode? Because light attracts bugs")
+
+
+def show_desktop():
+    try:
+        import pyautogui
+        pyautogui.hotkey("win", "d")
+        speak("Showing the desktop")
+    except Exception:
+        speak("Sorry, I could not do that")
+
+
+def search_google(query):
+    speak(f"Searching Google for {query}")
+    webbrowser.open("https://www.google.com/search?q=" + quote_plus(query))
+
+
+def play_youtube(query):
+    speak(f"Playing {query} on YouTube")
+    try:
+        import pywhatkit
+        pywhatkit.playonyt(query)
+    except Exception:                      # no internet / library problem
+        webbrowser.open("https://www.youtube.com/results?search_query="
+                        + quote_plus(query))
+
+
+def wiki_summary(topic):
+    try:
+        import wikipedia
+        try:
+            text = wikipedia.summary(topic, sentences=2)
+        except wikipedia.DisambiguationError as e:
+            text = wikipedia.summary(e.options[0], sentences=2)
+        text = clean_summary(text)
+        print("\n" + text + "\n")
+        speak(text)
+    except Exception as e:
+        if e.__class__.__name__ == "PageError":
+            speak(f"Sorry, I could not find {topic} on Wikipedia")
+        else:
+            speak("Sorry, I could not reach Wikipedia")
+
+
+def greet():
+    hour = datetime.now().hour
+    part = ("Good morning" if hour < 12 else
+            "Good afternoon" if hour < 17 else "Good evening")
+    speak(random.choice([f"{part}! How can I help you?",
+                         "Hello! I am ready to help",
+                         "Hi there! What can I do for you?"]))
+
+
+def tell_features():
+    print(CHEAT_SHEET)
+    speak("I can take voice notes, set and edit reminders, open approved "
+          "apps, do dictation, search Google, play YouTube, tell the time "
+          "and battery, take screenshots, control the volume, and tell "
+          "jokes. The full list is shown on the screen")
+
+
+def handle_extras(command):
+    """Runs an extra command. Returns True if it was one."""
+    name, arg = classify_extra(command)
+    if name is None:
+        return False
+    actions = {
+        "help": tell_features,
+        "intro": lambda: speak("I am your voice controlled desktop "
+                               "assistant, built with Python"),
+        "how_are_you": lambda: speak("I am doing great, thank you for asking"),
+        "thanks": lambda: speak("You are welcome"),
+        "greet": greet,
+        "google": lambda: search_google(arg),
+        "youtube": lambda: play_youtube(arg),
+        "wiki": lambda: wiki_summary(arg),
+        "time": say_time,
+        "date": say_date,
+        "battery": say_battery,
+        "system": say_system,
+        "screenshot": take_screenshot,
+        "volume": lambda: change_volume(arg),
+        "joke": tell_joke,
+        "desktop": show_desktop,
+    }
+    actions[name]()
+    return True
+
+
 # ---------------- COMMAND HANDLER ----------------
 def handle(command):
     """Returns False when the assistant should stop."""
@@ -735,8 +1226,19 @@ def handle(command):
         read_notes()
     elif "delete" in command and "note" in command:
         delete_notes()
+    elif DICTATION_RE.search(command):
+        if re.search(r"\b(stop|end|cancel)\b", command):
+            speak("Dictation is not running")
+        elif re.search(r"\b(read|say)\b", command):
+            read_last_dictation()
+        elif re.search(r"\b(open|show|last|previous|latest)\b", command):
+            open_last_dictation()
+        else:
+            dictate()
     elif command.startswith("open ") or command.startswith("launch "):
         open_apps(command.split(" ", 1)[1])
+    elif handle_extras(command):
+        pass
     elif is_list_request(command):
         list_approved()
     elif (re.search(r"\b(test|check)\b", command)
@@ -756,6 +1258,7 @@ def main():
     init_db()
     threading.Thread(target=reminder_checker, daemon=True).start()
     print("Using microphone index:", MIC_INDEX)
+    print(CHEAT_SHEET)
     speak("Hello, I am your voice assistant")
     running = True
     while running:
