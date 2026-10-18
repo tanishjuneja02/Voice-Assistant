@@ -6,3 +6,6 @@ __pycache__/
 .env
 dictations/
 screenshots/
+api_key.txt
+assistant.db
+vosk-model-small-en-us-0.15/
