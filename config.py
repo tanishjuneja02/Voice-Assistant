@@ -18,7 +18,8 @@ WAKE_WORD = "assistant"
 VOSK_MODEL_PATH = "vosk-model-small-en-us-0.15"
 
 # ---------------- ASK ANYTHING (AI) ----------------
-AI_PROVIDER = "anthropic"         # "anthropic" (needs a key) or "ollama" (free, local)
+AI_ENABLED = False                # True = answer any question with AI
+AI_PROVIDER = "ollama"         # "anthropic" (needs a key) or "ollama" (free, local)
 ANTHROPIC_MODEL = "claude-haiku-5-5"
 OLLAMA_MODEL = "llama3.2"
 OLLAMA_URL = "http://localhost:11434/api/chat"

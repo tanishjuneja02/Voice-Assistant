@@ -19,8 +19,9 @@ _history = []          # last few turns, so follow-up questions work
 class AIError(Exception):
     pass
 
-
 def is_configured():
+    if not getattr(config, "AI_ENABLED", True):
+        return False
     if config.AI_PROVIDER == "ollama":
         return True
     return bool(config.get_api_key())

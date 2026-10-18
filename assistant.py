@@ -1142,7 +1142,6 @@ CHEAT_SHEET = """
  Timers     set a timer for 5 minutes  |  how much time is left  |  cancel timer
             start / stop / reset stopwatch
  Wake word  turn on Wake Word, then say "Hey Assistant" before a command
- Ask AI     ask anything else: "why is the sky blue", "new chat" to reset
  Notes+     what did I note about milk  |  delete note about milk
             delete note number 2  |  delete all notes
  Dictation+ delete my last dictation  |  delete dictation number 2
@@ -1399,8 +1398,8 @@ def tell_features():
           "apps, do dictation, search Google, play YouTube, tell the time "
           "and battery, take screenshots, control the volume, close apps, "
           "tell the weather, run timers, play music, type for you, give a "
-          "daily briefing, control Wi-Fi and brightness, answer general "
-          "questions, and tell jokes. The full list is shown on the screen")
+          "daily briefing, control Wi-Fi and brightness, and tell jokes. "
+          "The full list is shown on the screen")
 
 
 def handle_extras(command):
@@ -1440,19 +1439,12 @@ TYPING_RE = re.compile(
     r"^typing mode$")
 ASK_RE = re.compile(r"^(?:hey |ok |okay )?(?:ask|ask the)?\s*"
                     r"(?:ai|claude|chat ?gpt)\s*[,:]?\s+(.+)$")
-_ai_hint_given = False
 
 
 def ask_ai(question):
     """Send a question to the AI model and speak the answer."""
-    global _ai_hint_given
     if not ai_chat.is_configured():
-        if not _ai_hint_given:
-            _ai_hint_given = True
-            speak("Sorry, I did not understand. To let me answer any "
-                  "question, add your API key as described in config dot py")
-        else:
-            speak("Sorry, I did not understand")
+        speak("Sorry, I did not understand")
         return
     emit("status", "thinking")
     try:
