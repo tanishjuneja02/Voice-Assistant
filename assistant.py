@@ -1,8 +1,8 @@
-import array
-import math
+import json
 import os
 import random
 import re
+import sys
 import time
 import threading
 import sqlite3
@@ -14,7 +14,14 @@ from urllib.parse import quote_plus
 import speech_recognition as sr
 import pyttsx3
 
-import nlu          # understands normal sentences (see nlu.py)
+import ai_chat
+import config
+import skills
+
+try:                              # understands normal sentences
+    import nlu
+except ImportError:               # still works without nlu.py
+    nlu = None
 
 LANGUAGE = "en-IN"   # Indian English. If recognition gets worse, try "en-US"
 
@@ -62,6 +69,29 @@ def emit(kind, text=""):
             pass
 
 
+CONFIRM_HOOK = None              # the window sets this to show a Yes/No box
+_src = threading.local()         # "voice" or "text": where the command came from
+
+YES_RE = re.compile(r"\b(?:yes|yeah|yep|yup|sure|ok|okay|confirm|do it|"
+                    r"go ahead|proceed|affirmative)\b")
+NO_RE = re.compile(r"\b(?:no|nope|nah|cancel|don'?t|do not|stop|negative)\b")
+
+
+def confirm(prompt):
+    """Ask a yes/no question before a risky action. True only for a clear yes."""
+    speak(prompt)
+    if getattr(_src, "mode", "voice") == "text" and CONFIRM_HOOK:
+        return bool(CONFIRM_HOOK(prompt))
+    speak("Say yes or no")
+    for _ in range(2):
+        answer = listen()
+        if YES_RE.search(answer) and not NO_RE.search(answer):
+            return True
+        if NO_RE.search(answer):
+            return False
+    return False
+
+
 def ensure_com():
     """The Windows voice needs COM started once in every thread."""
     if getattr(_com, "ready", False):
@@ -81,52 +111,13 @@ def speak(text):
     ensure_com()
     with _speak_lock:
         engine = pyttsx3.init()
-
-        def on_word(name, location=0, length=4):
-            # one pulse per spoken word -> drives the assistant's sound wave
-            try:
-                pulse = min(1.0, 0.4 + (length or 4) * 0.07 + random.random() * 0.25)
-            except Exception:
-                pulse = 0.7
-            emit("level_assistant", f"{pulse:.2f}")
-
-        try:
-            engine.connect("started-word", on_word)
-        except Exception:
-            pass                       # the wave just stays calm
         engine.say(text)
         engine.runAndWait()
     emit("status", "idle")
 
 
-class _LevelStream:
-    """Wraps the microphone stream and reports how loud you are, so the
-    window can draw your voice as a moving wave."""
-
-    def __init__(self, stream):
-        self._stream = stream
-
-    def read(self, size):
-        data = self._stream.read(size)
-        try:
-            samples = array.array("h", data)          # 16-bit audio
-            if samples:
-                rms = math.sqrt(sum(x * x for x in samples) / len(samples))
-                emit("level_user", f"{rms:.1f}")
-        except Exception:
-            pass
-        return data
-
-    def close(self):
-        self._stream.close()
-
-    def __getattr__(self, name):
-        return getattr(self._stream, name)
-
-
 def listen():
     with sr.Microphone(device_index=MIC_INDEX) as source:
-        source.stream = _LevelStream(source.stream)
         recognizer.adjust_for_ambient_noise(source, duration=0.5)
         print("Listening...")
         emit("status", "listening")
@@ -740,8 +731,18 @@ STOP_DICT = re.compile(
     r"|\bend of dictation\b", re.I)
 CANCEL_DICT = re.compile(
     r"\b(?:cancel|discard|abort)\s+(?:the\s+|my\s+)?dictat\w*", re.I)
+# "delete that", "scratch that", "undo", "delete the last sentence" ...
 UNDO_DICT = re.compile(
-    r"(?:delete|remove|undo|scratch)(?: that| the last \w+| last \w+)?", re.I)
+    r"(?:delete|remove|erase|scratch|undo|cancel)\s+(?:that|this|it)"
+    r"(?:\s+(?:phrase|part|sentence|line|bit|thing))?"
+    r"|(?:delete|remove|erase|scratch)\s+(?:the\s+)?last\s+"
+    r"(?:phrase|sentence|line|part|bit|thing)"
+    r"|undo(?:\s+that)?|scratch\s+that|go\s+back|delete|remove|erase", re.I)
+UNDO_WORD = re.compile(
+    r"(?:delete|remove|erase)\s+(?:the\s+)?last\s+(?:word|words)", re.I)
+UNDO_AT_END = re.compile(
+    r"[\s,.]+(?:delete that|scratch that|undo that|remove that|erase that)"
+    r"[\s.!?]*$", re.I)
 DICTATION_RE = re.compile(r"dictat|voice typing|speech.to.text")
 
 
@@ -765,12 +766,40 @@ def tidy_dictation(text):
 def process_dictation_phrase(phrase, parts):
     """Handle one spoken phrase. Returns 'continue', 'stop' or 'cancel'."""
     phrase = phrase.strip()
+    plain = phrase.strip(" .,!?").lower()
     if CANCEL_DICT.search(phrase):
         return "cancel"
-    if UNDO_DICT.fullmatch(phrase.lower()):
+
+    # "delete the last word" -> drop only the final word
+    if UNDO_WORD.fullmatch(plain):
         if parts:
-            print("   (removed:", parts.pop().strip(), ")")
+            words = parts[-1].rstrip().split(" ")
+            removed = words.pop()
+            if words:
+                parts[-1] = " ".join(words)
+            else:
+                parts.pop()
+            emit("info", f"Removed the word: {removed}")
+        else:
+            emit("info", "Nothing to delete yet")
         return "continue"
+
+    # "delete that" / "undo" on its own -> remove the last phrase
+    if UNDO_DICT.fullmatch(plain):
+        if parts:
+            removed = parts.pop().strip()
+            print("   (removed:", removed, ")")
+            emit("info", f"Removed: {removed}")
+        else:
+            emit("info", "Nothing to delete yet")
+        return "continue"
+
+    # "I went to the market delete that" -> drop what was just said
+    m = UNDO_AT_END.search(phrase)
+    if m and phrase[:m.start()].strip():
+        emit("info", f"Removed: {phrase[:m.start()].strip()}")
+        return "continue"
+
     m = STOP_DICT.search(phrase)
     content = phrase[:m.start()] if m else phrase
     content = apply_spoken_punctuation(content).strip(" \t")
@@ -811,7 +840,6 @@ def dictate():
     recognizer.pause_threshold = 1.5             # allow longer pauses
     try:
         with sr.Microphone(device_index=MIC_INDEX) as source:
-            source.stream = _LevelStream(source.stream)
             recognizer.adjust_for_ambient_noise(source, duration=0.7)
             print("\n--- DICTATING --- (say 'stop dictation' to finish)")
             emit("status", "listening")
@@ -881,6 +909,147 @@ def open_last_dictation():
         return
     speak("Opening your last dictation")
     open_file(row[0])
+
+
+def all_dictations():
+    """Newest first. Number 1 is the newest (same order as the GUI list)."""
+    db = sqlite3.connect(DB)
+    rows = db.execute(
+        "SELECT id, file, text, created FROM dictations ORDER BY id DESC"
+    ).fetchall()
+    db.close()
+    return rows
+
+
+def remove_dictation(row):
+    """Delete the database row AND the saved .txt file."""
+    db = sqlite3.connect(DB)
+    db.execute("DELETE FROM dictations WHERE id=?", (row[0],))
+    db.commit()
+    db.close()
+    try:
+        if row[1] and os.path.exists(row[1]):
+            os.remove(row[1])
+    except OSError as e:
+        print("Could not remove the file:", e)
+
+
+def delete_dictations(command):
+    """'delete my last dictation' / 'delete dictation number 2' /
+    'delete all dictations' / 'delete the dictation about holiday'."""
+    rows = all_dictations()
+    if not rows:
+        speak("You have no saved dictations")
+        return
+    if re.search(r"\b(all|every|everything)\b", command) or \
+            re.search(r"\bdictations\b", command) and \
+            not re.search(r"\b(last|latest|previous|number|no|first|"
+                          r"second|third)\b", command):
+        if confirm(f"Delete all {len(rows)} saved dictations?"):
+            for row in rows:
+                remove_dictation(row)
+            speak("All dictations deleted")
+        else:
+            speak("Okay, I kept your dictations")
+        return
+    m = (re.search(r"\b(?:number|no)\s*(\d+|one|two|three|four|five|six)\b",
+                   command)
+         or re.search(r"\b(first|second|third|fourth|fifth)\b", command))
+    if m:
+        word = m.group(1)
+        n = int(word) if word.isdigit() else ORDINALS[word]
+        if not 1 <= n <= len(rows):
+            speak(f"You only have {len(rows)} dictations")
+            return
+        chosen = rows[n - 1]
+    elif re.search(r"\b(last|latest|previous|recent|newest)\b", command):
+        chosen = rows[0]
+    else:
+        said = [w for w in re.findall(r"[a-z]+", command)
+                if w not in NOTE_WORDS_IGNORED]
+        hits = [r for r in rows if said and all(w in r[2].lower() for w in said)]
+        if len(hits) == 1:
+            chosen = hits[0]
+        elif len(rows) == 1:
+            chosen = rows[0]
+        else:
+            speak("Which dictation? Say: delete my last dictation, delete "
+                  "dictation number 2, or delete all dictations")
+            return
+    preview = chosen[2][:60] + ("..." if len(chosen[2]) > 60 else "")
+    remove_dictation(chosen)
+    speak(f"Deleted the dictation: {preview}")
+
+
+NOTE_WORDS_IGNORED = {"delete", "remove", "erase", "clear", "the", "my", "a",
+                      "dictation", "dictations", "voice", "typing", "about",
+                      "please", "saved", "that", "this", "one"}
+
+
+# ---------------- TYPE INTO ANY APP (typing mode) ----------------
+STOP_TYPING = re.compile(
+    r"\b(?:stop|end|finish|exit)\s+(?:the\s+)?typing(?:\s+mode)?\b")
+
+
+def typing_mode():
+    """Everything you say is typed into whatever app has the cursor."""
+    speak("Typing mode on. Click where you want the text, then speak. "
+          "Say stop typing to finish. Say delete that to undo.")
+    time.sleep(0.5)
+    typed = []                                  # characters typed per phrase
+    quiet_rounds = 0
+    try:
+        with sr.Microphone(device_index=MIC_INDEX) as source:
+            recognizer.adjust_for_ambient_noise(source, duration=0.7)
+            emit("status", "listening")
+            while True:
+                try:
+                    audio = recognizer.listen(source, timeout=10,
+                                              phrase_time_limit=30)
+                    phrase = recognizer.recognize_google(audio,
+                                                         language=LANGUAGE)
+                except (sr.WaitTimeoutError, sr.UnknownValueError):
+                    quiet_rounds += 1
+                    if quiet_rounds >= 6:       # about a minute of silence
+                        break
+                    continue
+                except sr.RequestError:
+                    break
+                quiet_rounds = 0
+                emit("dictation", phrase)
+                plain = phrase.strip(" .,!?").lower()
+                if STOP_TYPING.search(plain):
+                    break
+                if UNDO_DICT.fullmatch(plain):
+                    if typed:
+                        skills.backspace(typed.pop())
+                        emit("info", "Deleted the last phrase")
+                    continue
+                typed.append(skills.type_phrase(apply_spoken_punctuation(phrase)))
+    except Exception as e:
+        print("Typing mode error:", e)
+    emit("status", "idle")
+    speak("Typing mode off")
+
+
+# ---------------- DAILY BRIEFING ----------------
+def daily_briefing():
+    now = datetime.now()
+    part = ("Good morning" if now.hour < 12 else
+            "Good afternoon" if now.hour < 17 else "Good evening")
+    speak(f"{part}! {time_message(now)}. {date_message(now)}")
+    weather = skills.weather_brief()
+    speak(weather or "I could not get the weather right now")
+    today = [(text, datetime.strptime(due, DB_TIME_FORMAT))
+             for _, text, due in pending_reminders()
+             if datetime.strptime(due, DB_TIME_FORMAT).date() == now.date()]
+    if not today:
+        speak("You have no reminders for today")
+    else:
+        speak(f"You have {len(today)} reminder" + ("s" if len(today) != 1 else "")
+              + " today")
+        for text, when in today:
+            speak(f"{text}, at {fmt_time(when)}")
 
 
 # ---------------- APPROVED APPLICATIONS ----------------
@@ -968,10 +1137,23 @@ CHEAT_SHEET = """
  Info       what time is it  |  today's date  |  battery status  |  cpu usage
  Web        search google for ...  |  play ... on youtube  |  tell me about ...
  System     take a screenshot  |  volume up / down  |  mute  |  show desktop
+ Close      close notepad / calculator / paint / chrome / edge / vs code
+ Weather    what's the weather  |  will it rain today  |  weather in Delhi
+ Timers     set a timer for 5 minutes  |  how much time is left  |  cancel timer
+            start / stop / reset stopwatch
+ Wake word  turn on Wake Word, then say "Hey Assistant" before a command
+ Ask AI     ask anything else: "why is the sky blue", "new chat" to reset
+ Notes+     what did I note about milk  |  delete note about milk
+            delete note number 2  |  delete all notes
+ Dictation+ delete my last dictation  |  delete dictation number 2
+            while dictating: "delete that" / "delete the last word"
+ Music      play / pause / next song / previous song
+ Type       type hello world  |  start typing mode ... stop typing
+ Briefing   good morning  (time, weather, today's reminders)
+ PC         wifi off / on  |  brightness up / set brightness to 50
+            lock the computer   (asks you to confirm)
  Fun        tell me a joke  |  test the alarm
  Stop       stop
- Tip        you can also talk normally: "can you remind me to study at 6",
-            "i'm bored", "how much battery is left", "jot down buy milk"
 ==========================================================
 """
 
@@ -1215,8 +1397,10 @@ def tell_features():
     print(CHEAT_SHEET)
     speak("I can take voice notes, set and edit reminders, open approved "
           "apps, do dictation, search Google, play YouTube, tell the time "
-          "and battery, take screenshots, control the volume, and tell "
-          "jokes. The full list is shown on the screen")
+          "and battery, take screenshots, control the volume, close apps, "
+          "tell the weather, run timers, play music, type for you, give a "
+          "daily briefing, control Wi-Fi and brightness, answer general "
+          "questions, and tell jokes. The full list is shown on the screen")
 
 
 def handle_extras(command):
@@ -1248,20 +1432,90 @@ def handle_extras(command):
 
 
 # ---------------- COMMAND HANDLER ----------------
+BRIEFING_RE = re.compile(
+    r"^(?:good morning\b|(?:give me )?(?:my |the )?(?:daily |morning )?"
+    r"(?:briefing|brief)\b|brief me\b|what(?:'s| is) my day\b)")
+TYPING_RE = re.compile(
+    r"\b(?:start|begin|enable|turn on)\s+(?:the\s+)?typing(?:\s+mode)?\b|"
+    r"^typing mode$")
+ASK_RE = re.compile(r"^(?:hey |ok |okay )?(?:ask|ask the)?\s*"
+                    r"(?:ai|claude|chat ?gpt)\s*[,:]?\s+(.+)$")
+_ai_hint_given = False
+
+
+def ask_ai(question):
+    """Send a question to the AI model and speak the answer."""
+    global _ai_hint_given
+    if not ai_chat.is_configured():
+        if not _ai_hint_given:
+            _ai_hint_given = True
+            speak("Sorry, I did not understand. To let me answer any "
+                  "question, add your API key as described in config dot py")
+        else:
+            speak("Sorry, I did not understand")
+        return
+    emit("status", "thinking")
+    try:
+        speak(ai_chat.ask(question))
+    except ai_chat.AIError as e:
+        print("AI error:", e)
+        emit("info", f"AI problem: {e}")
+        speak("Sorry, I could not get an answer right now")
+
+
+# nlu must NOT rewrite these: it would turn "set a timer" into a plain
+# reminder, and it would change the words you want typed or asked.
+NLU_SKIP = re.compile(r"\b(?:timers?|stop ?watch|count ?down|typing mode)\b"
+                      r"|^(?:type|ask)\b")
+
+
 def known_names():
-    """App and website names the language layer may turn into 'open ...'."""
-    return list(APPROVED_APPS) + list(APPROVED_SITES) + list(ALIASES)
+    return list(APPROVED_APPS) + list(APPROVED_SITES)
 
 
-def handle(command, _retry=False):
-    """Returns False when the assistant should stop."""
-    # Turn normal speech ("could you please open up notepad") into a command
-    # this file knows ("open notepad"). See nlu.py.
-    command = nlu.interpret(command, known_names())
+def nlu_guess(original):
+    """Last chance before the AI: jokes, battery, 'it's too loud', 'search for'
+    ... Open questions are NOT guessed here, so the AI answers them."""
+    if nlu is None:
+        return None
+    try:
+        c = nlu.clean(original)
+        return nlu._explicit_knowledge(c) or nlu._fuzzy_intent(c)
+    except Exception as e:
+        print("nlu guess problem:", e)
+        return None
+
+
+def handle(command, source="voice", _guessed=False):
+    """Returns False when the assistant should stop.
+    source is "voice" or "text" (typed in the window)."""
+    _src.mode = source
+    command = command.strip().rstrip(".!?").strip()
+    original = command
+    if (nlu is not None and not NLU_SKIP.search(command)
+            and extract_note(command) is None):
+        command = nlu.interpret(command, known_names())   # normal speech
+        if command != original.lower():
+            print(f"   (understood as: {command})")
     note_text = extract_note(command)
 
     if note_text is not None:
         save_note(note_text)
+    elif re.search(r"\b(?:delete|remove|erase|clear)\b", command) and \
+            DICTATION_RE.search(command):
+        delete_dictations(command)             # was starting a new dictation!
+    elif BRIEFING_RE.match(command):
+        daily_briefing()
+    elif TYPING_RE.search(command):
+        typing_mode()
+    elif re.search(r"\b(?:new chat|forget (?:this|our|the) conversation|"
+                   r"reset (?:the )?conversation)\b", command):
+        ai_chat.reset()
+        speak("Okay, starting a fresh conversation")
+    elif ASK_RE.match(command):
+        ask_ai(ASK_RE.match(command).group(1))
+    elif skills.handle_skill(command):
+        pass
     elif is_edit_reminder(command):
         edit_reminder(command)
     elif "remind" in command:
@@ -1278,8 +1532,6 @@ def handle(command, _retry=False):
             list_reminders()
     elif "read" in command and "note" in command:
         read_notes()
-    elif "delete" in command and "note" in command:
-        delete_notes()
     elif DICTATION_RE.search(command):
         if re.search(r"\b(stop|end|cancel)\b", command):
             speak("Dictation is not running")
@@ -1304,15 +1556,106 @@ def handle(command, _retry=False):
         speak("Goodbye")
         return False
     else:
-        # Nothing matched. Make one last attempt with fuzzy matching (and the
-        # optional AI), then give up politely.
-        guessed = None if _retry else nlu.guess(command, known_names())
+        guessed = None if _guessed else nlu_guess(original)
         if guessed and guessed != command:
-            print("(Understood as:", guessed + ")")
-            emit("info", f"Understood as: {guessed}")
-            return handle(guessed, _retry=True)
-        speak("Sorry, I did not understand. Say 'what can you do' to hear my features")
+            print(f"   (guessed: {guessed})")
+            return handle(guessed, source, _guessed=True)
+        ask_ai(original)                       # anything else -> the AI model
     return True
+
+
+# ---------------- WAKE WORD ("Hey Assistant") ----------------
+WAKE_RE = re.compile(r"\b(?:hey|hi|ok|okay|hello)\s*,?\s+"
+                     + re.escape(config.WAKE_WORD) + r"s?\b")
+_vosk = {"tried": False, "model": None}
+
+
+def get_vosk_model():
+    """Offline wake word detection, if a Vosk model folder exists."""
+    if not _vosk["tried"]:
+        _vosk["tried"] = True
+        try:
+            if os.path.isdir(config.VOSK_MODEL_PATH):
+                from vosk import Model, SetLogLevel
+                SetLogLevel(-1)
+                _vosk["model"] = Model(config.VOSK_MODEL_PATH)
+                print("Wake word: using offline Vosk model")
+            else:
+                print("Wake word: no Vosk model found, using Google "
+                      "(see config.py to go offline)")
+        except Exception as e:
+            print("Vosk problem, using Google instead:", e)
+    return _vosk["model"]
+
+
+def heard_wake(audio, model):
+    """Returns the text after the wake word ('' if none), or None if the
+    wake word was not said."""
+    try:
+        if model is not None:
+            from vosk import KaldiRecognizer
+            grammar = json.dumps([f"{p} {config.WAKE_WORD}" for p in
+                                  ("hey", "hi", "ok", "okay", "hello")]
+                                 + ["[unk]"])
+            rec = KaldiRecognizer(model, 16000, grammar)
+            rec.AcceptWaveform(audio.get_raw_data(convert_rate=16000,
+                                                  convert_width=2))
+            text = json.loads(rec.FinalResult()).get("text", "")
+        else:
+            text = recognizer.recognize_google(audio, language=LANGUAGE)
+    except sr.UnknownValueError:
+        return None
+    except sr.RequestError:
+        time.sleep(3)
+        return None
+    m = WAKE_RE.search(text.lower())
+    if not m:
+        return None
+    return text.lower()[m.end():].strip(" ,.")
+
+
+def wait_for_wake(active):
+    """Blocks until the wake word is heard. Returns any command spoken in the
+    same breath ('' if none), or None if wake mode was switched off."""
+    model = get_vosk_model()
+    with sr.Microphone(device_index=MIC_INDEX) as source:
+        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        emit("status", "waiting")
+        while active.is_set():
+            try:
+                audio = recognizer.listen(source, timeout=1.5,
+                                          phrase_time_limit=5)
+            except sr.WaitTimeoutError:
+                continue
+            rest = heard_wake(audio, model)
+            if rest is not None:
+                return rest
+    return None
+
+
+def wake_loop(active):
+    """Run until `active` (a threading.Event) is cleared, or you say stop.
+    Say 'Hey Assistant', wait for the beep, then say your command."""
+    emit("info", f'Wake word is on. Say "Hey {config.WAKE_WORD.title()}".')
+    try:
+        while active.is_set():
+            rest = wait_for_wake(active)
+            if rest is None:
+                break
+            try:
+                import winsound
+                winsound.Beep(900, 120)
+            except Exception:
+                pass
+            command = rest or listen()
+            if not active.is_set():
+                break
+            if command and not handle(command):
+                active.clear()                 # you said "stop"
+            elif not command:
+                emit("info", "I did not hear a command")
+    finally:
+        emit("status", "idle")
 
 
 def main():
@@ -1321,12 +1664,19 @@ def main():
     print("Using microphone index:", MIC_INDEX)
     print(CHEAT_SHEET)
     speak("Hello, I am your voice assistant")
+    if "--wake" in sys.argv:
+        active = threading.Event()
+        active.set()
+        wake_loop(active)
+        return
     running = True
     while running:
         command = listen()
         if command:
             running = handle(command)
 
+
+skills.init(speak, listen, alert, confirm, DB)
 
 if __name__ == "__main__":
     main()
