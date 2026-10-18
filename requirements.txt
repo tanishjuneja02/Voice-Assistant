@@ -12,3 +12,6 @@ pyautogui
 wikipedia
 pyjokes
 pywhatkit
+rapidfuzz
+# optional - only if you turn on USE_LLM in nlu.py:
+# anthropic

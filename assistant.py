@@ -1,3 +1,5 @@
+import array
+import math
 import os
 import random
 import re
@@ -11,6 +13,8 @@ from urllib.parse import quote_plus
 
 import speech_recognition as sr
 import pyttsx3
+
+import nlu          # understands normal sentences (see nlu.py)
 
 LANGUAGE = "en-IN"   # Indian English. If recognition gets worse, try "en-US"
 
@@ -77,13 +81,52 @@ def speak(text):
     ensure_com()
     with _speak_lock:
         engine = pyttsx3.init()
+
+        def on_word(name, location=0, length=4):
+            # one pulse per spoken word -> drives the assistant's sound wave
+            try:
+                pulse = min(1.0, 0.4 + (length or 4) * 0.07 + random.random() * 0.25)
+            except Exception:
+                pulse = 0.7
+            emit("level_assistant", f"{pulse:.2f}")
+
+        try:
+            engine.connect("started-word", on_word)
+        except Exception:
+            pass                       # the wave just stays calm
         engine.say(text)
         engine.runAndWait()
     emit("status", "idle")
 
 
+class _LevelStream:
+    """Wraps the microphone stream and reports how loud you are, so the
+    window can draw your voice as a moving wave."""
+
+    def __init__(self, stream):
+        self._stream = stream
+
+    def read(self, size):
+        data = self._stream.read(size)
+        try:
+            samples = array.array("h", data)          # 16-bit audio
+            if samples:
+                rms = math.sqrt(sum(x * x for x in samples) / len(samples))
+                emit("level_user", f"{rms:.1f}")
+        except Exception:
+            pass
+        return data
+
+    def close(self):
+        self._stream.close()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
 def listen():
     with sr.Microphone(device_index=MIC_INDEX) as source:
+        source.stream = _LevelStream(source.stream)
         recognizer.adjust_for_ambient_noise(source, duration=0.5)
         print("Listening...")
         emit("status", "listening")
@@ -768,6 +811,7 @@ def dictate():
     recognizer.pause_threshold = 1.5             # allow longer pauses
     try:
         with sr.Microphone(device_index=MIC_INDEX) as source:
+            source.stream = _LevelStream(source.stream)
             recognizer.adjust_for_ambient_noise(source, duration=0.7)
             print("\n--- DICTATING --- (say 'stop dictation' to finish)")
             emit("status", "listening")
@@ -926,6 +970,8 @@ CHEAT_SHEET = """
  System     take a screenshot  |  volume up / down  |  mute  |  show desktop
  Fun        tell me a joke  |  test the alarm
  Stop       stop
+ Tip        you can also talk normally: "can you remind me to study at 6",
+            "i'm bored", "how much battery is left", "jot down buy milk"
 ==========================================================
 """
 
@@ -1202,8 +1248,16 @@ def handle_extras(command):
 
 
 # ---------------- COMMAND HANDLER ----------------
-def handle(command):
+def known_names():
+    """App and website names the language layer may turn into 'open ...'."""
+    return list(APPROVED_APPS) + list(APPROVED_SITES) + list(ALIASES)
+
+
+def handle(command, _retry=False):
     """Returns False when the assistant should stop."""
+    # Turn normal speech ("could you please open up notepad") into a command
+    # this file knows ("open notepad"). See nlu.py.
+    command = nlu.interpret(command, known_names())
     note_text = extract_note(command)
 
     if note_text is not None:
@@ -1250,7 +1304,14 @@ def handle(command):
         speak("Goodbye")
         return False
     else:
-        speak("Sorry, I did not understand")
+        # Nothing matched. Make one last attempt with fuzzy matching (and the
+        # optional AI), then give up politely.
+        guessed = None if _retry else nlu.guess(command, known_names())
+        if guessed and guessed != command:
+            print("(Understood as:", guessed + ")")
+            emit("info", f"Understood as: {guessed}")
+            return handle(guessed, _retry=True)
+        speak("Sorry, I did not understand. Say 'what can you do' to hear my features")
     return True
 
 
